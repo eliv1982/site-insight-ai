@@ -1,0 +1,32 @@
+# Deploy: docker compose -f docker-compose.deploy.yml up -d
+# Keep this file in same folder as .env
+name: app-deploy
+
+services:
+  backend:
+    image: eliv1982/backend:latest
+    container_name: backend
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  frontend:
+    image: eliv1982/frontend:latest
+    container_name: frontend
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_URL=/api
+    networks:
+      - app-network
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+networks:
+  app-network:
+    driver: bridge
