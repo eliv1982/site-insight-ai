@@ -36,6 +36,7 @@ dist/
 # Tests and local test artifacts are not needed by the runtime image
 tests/
 test-results/
+requirements-dev.txt
 
 # Frontend sources and generated dependencies are irrelevant to the backend image
 frontend/
