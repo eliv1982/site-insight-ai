@@ -17,7 +17,7 @@ DEFAULT_MODEL = "gpt-4o"  # или "gpt-3.5-turbo"
 class LLMClient:
     """
     Клиент для работы с LLM через Proxy API.
-    Поддерживает запросы с системным промптом и структурированный JSON-ответ.
+    Поддерживает запросы со структурированным JSON-ответом.
     """
 
     def __init__(
@@ -61,28 +61,6 @@ class LLMClient:
         self._api_key = value
         self._client = OpenAI(base_url=self._base_url, api_key=self._api_key)
 
-    def chat_with_system(self, system_prompt: str, user_prompt: str) -> str:
-        """
-        Запрос с явным системным промптом.
-
-        Args:
-            system_prompt: Системный промпт (роль модели).
-            user_prompt: Текст запроса пользователя.
-
-        Returns:
-            Текст ответа модели.
-        """
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
-        response = self._client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            max_tokens=self.max_tokens,
-        )
-        return response.choices[0].message.content or ""
-
     def chat_json(
         self,
         system_prompt: str,
@@ -91,7 +69,7 @@ class LLMClient:
     ) -> dict:
         """
         Запрос со структурированным ответом в формате JSON.
-        Ответ парсится в Python-словарь.
+        Ответ парсится в Python-словарь; строгую схему проверяет вызывающий код.
 
         Args:
             system_prompt: Системный промпт (например, «отвечай только валидным JSON»).

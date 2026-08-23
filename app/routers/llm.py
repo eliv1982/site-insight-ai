@@ -5,7 +5,13 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from app.services.analyzer import AnalyzerError, SiteFetchError, run_site_analysis
+from app.services.analyzer import (
+    AnalysisGenerationError,
+    AnalyzerError,
+    AnalyzeSiteResponse,
+    SiteFetchError,
+    run_site_analysis,
+)
 from app.services.llm_client import LLMClient
 
 router = APIRouter()
@@ -26,16 +32,17 @@ class AnalyzeRequest(BaseModel):
     url: str = Field(..., min_length=1, description="URL сайта для анализа")
 
 
-@router.post("/analyze-site")
-def analyze_site(request: AnalyzeRequest) -> dict:
+@router.post("/analyze-site", response_model=AnalyzeSiteResponse)
+def analyze_site(request: AnalyzeRequest) -> AnalyzeSiteResponse:
     """
-    Анализ сайта по URL: загрузка HTML, очистка текста, пошаговый анализ через LLM,
-    итоговый отчёт с кратким содержанием.
+    Анализ текста одной публичной HTML-страницы одним структурированным запросом к LLM.
     """
     try:
         client = get_llm_client()
         return run_site_analysis(url=request.url, llm_client=client)
     except SiteFetchError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.public_message) from e
+    except AnalysisGenerationError as e:
         raise HTTPException(status_code=e.status_code, detail=e.public_message) from e
     except AnalyzerError as e:
         raise HTTPException(status_code=400, detail="Не удалось обработать содержимое сайта") from e
