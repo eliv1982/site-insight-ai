@@ -1,0 +1,72 @@
+# Version control and repository metadata
+.git
+.gitignore
+.gitattributes
+.dockerignore
+Backend-Dockerfile
+
+# Environment files and local secrets
+.env
+.env.*
+!.env.example
+
+# Python bytecode, caches, environments, and build output
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Tests and local test artifacts are not needed by the runtime image
+tests/
+test-results/
+
+# Frontend sources and generated dependencies are irrelevant to the backend image
+frontend/
+node_modules/
+
+# IDE, editor, and local tooling metadata
+.idea/
+.vscode/
+.cursor/
+.codex/
+.agents/
+*.swp
+*.swo
+*~
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+.cache/
+tmp/
+temp/
+
+# Repository-only documentation and deployment helpers
+*.md
+docker-compose*.yml
+deploy.sh
+update-containers.sh
+cron.docker-update.example
+final_analyze_example.json
