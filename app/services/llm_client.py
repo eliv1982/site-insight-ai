@@ -17,7 +17,7 @@ DEFAULT_MODEL = "gpt-4o"  # или "gpt-3.5-turbo"
 class LLMClient:
     """
     Клиент для работы с LLM через Proxy API.
-    Поддерживает обычные запросы, запросы с системным промптом и структурированный JSON-ответ.
+    Поддерживает запросы с системным промптом и структурированный JSON-ответ.
     """
 
     def __init__(
@@ -25,7 +25,6 @@ class LLMClient:
         base_url: str | None = None,
         api_key: str | None = None,
         model: str = DEFAULT_MODEL,
-        system_prompt: str | None = None,
         max_tokens: int = 4096,
     ):
         """
@@ -33,13 +32,11 @@ class LLMClient:
             base_url: URL Proxy API (не api.openai.com). Если None — из env BASE_URL или PROXY_API_URL.
             api_key: Ключ для прокси (Bearer). Если None — из env OPENAI_API_KEY или API_KEY.
             model: Модель (по умолчанию gpt-4o).
-            system_prompt: Системный промпт по умолчанию (можно менять динамически).
             max_tokens: Максимум токенов в ответе (можно менять динамически).
         """
         self._base_url = base_url or os.getenv("BASE_URL") or os.getenv("PROXY_API_URL", "")
         self._api_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("API_KEY", "")
         self.model = model
-        self.system_prompt = system_prompt
         self.max_tokens = max_tokens
         self._client = OpenAI(
             base_url=self._base_url,
@@ -63,26 +60,6 @@ class LLMClient:
     def api_key(self, value: str) -> None:
         self._api_key = value
         self._client = OpenAI(base_url=self._base_url, api_key=self._api_key)
-
-    def chat(self, prompt: str) -> str:
-        """
-        Простой запрос к модели. Возвращает текст ответа.
-
-        Args:
-            prompt: Текст запроса пользователя.
-
-        Returns:
-            Текст ответа модели.
-        """
-        messages = [{"role": "user", "content": prompt}]
-        if self.system_prompt:
-            messages.insert(0, {"role": "system", "content": self.system_prompt})
-        response = self._client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            max_tokens=self.max_tokens,
-        )
-        return response.choices[0].message.content or ""
 
     def chat_with_system(self, system_prompt: str, user_prompt: str) -> str:
         """
