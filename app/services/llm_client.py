@@ -14,6 +14,10 @@ load_dotenv()
 DEFAULT_MODEL = "gpt-4o"  # или "gpt-3.5-turbo"
 
 
+class InvalidJSONResponse(Exception):
+    """Внутренняя ошибка ответа модели без раскрытия его содержимого."""
+
+
 class LLMClient:
     """
     Клиент для работы с LLM через Proxy API.
@@ -93,4 +97,7 @@ class LLMClient:
             response_format={"type": "json_object"},
         )
         content = response.choices[0].message.content or "{}"
-        return json.loads(content)
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise InvalidJSONResponse() from exc

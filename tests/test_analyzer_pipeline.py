@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 from pathlib import Path
+from types import SimpleNamespace
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
+from openai import APIConnectionError, APIStatusError, APITimeoutError
 
 from app.main import app
 from app.routers import llm as llm_router
@@ -25,11 +29,29 @@ VALID_ANALYSIS = {
     "analysis": "Содержание даёт общее представление о предложении и его аудитории.",
 }
 
+SECRET_API_KEY = "sk-observability-secret"
+SECRET_PAGE_TEXT = "page-text-observability-secret"
+SECRET_PROMPT = "prompt-observability-secret"
+SECRET_PROVIDER_URL = "https://provider-observability-secret.example/v1/chat"
+SECRET_RAW_MODEL_OUTPUT = "raw-model-output-observability-secret"
+SECRET_USER_URL = "https://user-url-observability-secret.example"
+SAFE_LOG_SENTINELS = (
+    SECRET_API_KEY,
+    SECRET_PAGE_TEXT,
+    SECRET_PROMPT,
+    SECRET_PROVIDER_URL,
+    SECRET_RAW_MODEL_OUTPUT,
+    SECRET_USER_URL,
+)
+
 
 class FakeLLMClient:
     def __init__(self, response=None, error: Exception | None = None) -> None:
         self.response = copy.deepcopy(response)
         self.error = error
+        self.model = "observability-test-model"
+        self.base_url = SECRET_PROVIDER_URL
+        self.api_key = SECRET_API_KEY
         self.calls: list[dict[str, str | None]] = []
 
     def chat_json(
@@ -50,6 +72,18 @@ class FakeLLMClient:
         return copy.deepcopy(self.response)
 
 
+class FakeSDKCompletions:
+    def __init__(self, content: str) -> None:
+        self.content = content
+        self.calls: list[dict] = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=self.content))]
+        )
+
+
 @pytest.fixture(autouse=True)
 def prevent_real_fetch(monkeypatch):
     def unexpected_fetch(*_args, **_kwargs):
@@ -62,6 +96,83 @@ def run_with_page(monkeypatch, llm_client: FakeLLMClient, page_text: str = "Те
     monkeypatch.setattr(analyzer, "fetch_html", lambda _url: "<html>stub</html>")
     monkeypatch.setattr(analyzer, "clean_html_to_text", lambda _html: page_text)
     return analyzer.run_site_analysis("public.example", llm_client)
+
+
+def make_llm_client_with_raw_content(content: str):
+    completions = FakeSDKCompletions(content)
+    llm_client = object.__new__(LLMClient)
+    llm_client._base_url = SECRET_PROVIDER_URL
+    llm_client._api_key = SECRET_API_KEY
+    llm_client.model = "observability-test-model"
+    llm_client.max_tokens = 4096
+    llm_client._client = SimpleNamespace(
+        chat=SimpleNamespace(completions=completions)
+    )
+    return llm_client, completions
+
+
+def make_provider_request() -> httpx.Request:
+    return httpx.Request(
+        "POST",
+        SECRET_PROVIDER_URL,
+        headers={"Authorization": f"Bearer {SECRET_API_KEY}"},
+        content=f"{SECRET_PROMPT} {SECRET_PAGE_TEXT}",
+    )
+
+
+def post_failed_analysis(monkeypatch, llm_client):
+    monkeypatch.setattr(analyzer, "fetch_html", lambda _url: "<html>stub</html>")
+    monkeypatch.setattr(
+        analyzer,
+        "clean_html_to_text",
+        lambda _html: SECRET_PAGE_TEXT,
+    )
+    monkeypatch.setattr(llm_router, "get_llm_client", lambda: llm_client)
+    return TestClient(app).post(
+        "/llm/analyze-site",
+        json={"url": SECRET_USER_URL},
+    )
+
+
+def assert_safe_failure_log(
+    caplog,
+    *,
+    category: str,
+    exception_class: str,
+    status_code: int | None = None,
+    validation_error_count: int | None = None,
+) -> None:
+    failure_records = [
+        record
+        for record in caplog.records
+        if "event=analysis_generation_failed" in record.getMessage()
+    ]
+    assert len(failure_records) == 1
+    assert failure_records[0].levelno == logging.ERROR
+
+    log_text = failure_records[0].getMessage()
+    assert f"category={category}" in log_text
+    assert f"exception_class={exception_class}" in log_text
+    assert "model=observability-test-model" in log_text
+    if status_code is not None:
+        assert f"status_code={status_code}" in log_text
+    else:
+        assert "status_code=" not in log_text
+    if validation_error_count is not None:
+        assert f"validation_error_count={validation_error_count}" in log_text
+    else:
+        assert "validation_error_count=" not in log_text
+
+    for sentinel in SAFE_LOG_SENTINELS:
+        assert sentinel not in log_text
+    assert analyzer.ANALYSIS_SYSTEM_PROMPT not in log_text
+
+
+def assert_public_generation_failure(response) -> None:
+    assert response.status_code == 502
+    assert response.json() == {"detail": analyzer.ANALYSIS_GENERATION_FAILED_MESSAGE}
+    for sentinel in SAFE_LOG_SENTINELS:
+        assert sentinel not in response.text
 
 
 def test_successful_pipeline_makes_one_call_and_returns_public_contract(monkeypatch):
@@ -222,24 +333,132 @@ def test_malformed_json_failure_is_sanitized(monkeypatch):
     assert len(llm_client.calls) == 1
 
 
-def test_proxy_failure_returns_only_sanitized_api_error(monkeypatch):
+def test_api_status_failure_logs_only_safe_provider_facts(monkeypatch, caplog):
+    caplog.set_level(logging.ERROR, logger=analyzer.__name__)
+    request = make_provider_request()
+    provider_response = httpx.Response(
+        503,
+        request=request,
+        content=SECRET_RAW_MODEL_OUTPUT,
+    )
+    provider_error = APIStatusError(
+        (
+            f"{SECRET_PROVIDER_URL} {SECRET_API_KEY} {SECRET_PROMPT} "
+            f"{SECRET_PAGE_TEXT} {SECRET_RAW_MODEL_OUTPUT}"
+        ),
+        response=provider_response,
+        body={"unsafe": SECRET_RAW_MODEL_OUTPUT},
+    )
+    llm_client = FakeLLMClient(error=provider_error)
+
+    response = post_failed_analysis(monkeypatch, llm_client)
+
+    assert_public_generation_failure(response)
+    assert_safe_failure_log(
+        caplog,
+        category="llm_api_error",
+        exception_class="APIStatusError",
+        status_code=503,
+    )
+    assert len(llm_client.calls) == 1
+
+
+def test_timeout_failure_logs_only_safe_timeout_facts(monkeypatch, caplog):
+    caplog.set_level(logging.ERROR, logger=analyzer.__name__)
+    llm_client = FakeLLMClient(error=APITimeoutError(make_provider_request()))
+
+    response = post_failed_analysis(monkeypatch, llm_client)
+
+    assert_public_generation_failure(response)
+    assert_safe_failure_log(
+        caplog,
+        category="llm_timeout",
+        exception_class="APITimeoutError",
+    )
+    assert len(llm_client.calls) == 1
+
+
+def test_connection_failure_logs_only_safe_connection_facts(monkeypatch, caplog):
+    caplog.set_level(logging.ERROR, logger=analyzer.__name__)
+    connection_error = APIConnectionError(
+        message=(
+            f"{SECRET_PROVIDER_URL} {SECRET_API_KEY} {SECRET_PROMPT} "
+            f"{SECRET_PAGE_TEXT} {SECRET_RAW_MODEL_OUTPUT}"
+        ),
+        request=make_provider_request(),
+    )
+    llm_client = FakeLLMClient(error=connection_error)
+
+    response = post_failed_analysis(monkeypatch, llm_client)
+
+    assert_public_generation_failure(response)
+    assert_safe_failure_log(
+        caplog,
+        category="llm_connection_error",
+        exception_class="APIConnectionError",
+    )
+    assert len(llm_client.calls) == 1
+
+
+def test_malformed_model_json_logs_only_safe_decode_facts(monkeypatch, caplog):
+    caplog.set_level(logging.ERROR, logger=analyzer.__name__)
+    raw_content = (
+        f'{{"unsafe": "{SECRET_RAW_MODEL_OUTPUT} {SECRET_API_KEY} '
+        f'{SECRET_PROVIDER_URL} {SECRET_PROMPT} {SECRET_PAGE_TEXT}"'
+    )
+    llm_client, completions = make_llm_client_with_raw_content(raw_content)
+
+    response = post_failed_analysis(monkeypatch, llm_client)
+
+    assert_public_generation_failure(response)
+    assert_safe_failure_log(
+        caplog,
+        category="json_decode_error",
+        exception_class="JSONDecodeError",
+    )
+    assert len(completions.calls) == 1
+
+
+def test_invalid_analysis_schema_logs_only_safe_validation_facts(monkeypatch, caplog):
+    caplog.set_level(logging.ERROR, logger=analyzer.__name__)
+    invalid_analysis = copy.deepcopy(VALID_ANALYSIS)
+    invalid_analysis.pop("purpose")
+    invalid_analysis["summary"] = (
+        f"{SECRET_RAW_MODEL_OUTPUT} {SECRET_API_KEY} {SECRET_PROVIDER_URL} "
+        f"{SECRET_PROMPT} {SECRET_PAGE_TEXT}"
+    )
+    llm_client = FakeLLMClient(response=invalid_analysis)
+
+    response = post_failed_analysis(monkeypatch, llm_client)
+
+    assert_public_generation_failure(response)
+    assert_safe_failure_log(
+        caplog,
+        category="schema_validation_error",
+        exception_class="ValidationError",
+        validation_error_count=1,
+    )
+    assert len(llm_client.calls) == 1
+
+
+def test_proxy_failure_returns_only_sanitized_api_error(monkeypatch, caplog):
+    caplog.set_level(logging.ERROR, logger=analyzer.__name__)
     sensitive_error = RuntimeError(
-        "proxy https://private-proxy.example failed with api_key=sk-sensitive-value"
+        (
+            f"{SECRET_PROVIDER_URL} {SECRET_API_KEY} {SECRET_PROMPT} "
+            f"{SECRET_PAGE_TEXT} {SECRET_RAW_MODEL_OUTPUT}"
+        )
     )
     llm_client = FakeLLMClient(error=sensitive_error)
-    monkeypatch.setattr(analyzer, "fetch_html", lambda _url: "<html>stub</html>")
-    monkeypatch.setattr(analyzer, "clean_html_to_text", lambda _html: "Текст страницы")
-    monkeypatch.setattr(llm_router, "get_llm_client", lambda: llm_client)
 
-    response = TestClient(app).post(
-        "/llm/analyze-site",
-        json={"url": "https://public.example"},
+    response = post_failed_analysis(monkeypatch, llm_client)
+
+    assert_public_generation_failure(response)
+    assert_safe_failure_log(
+        caplog,
+        category="unexpected_analysis_error",
+        exception_class="RuntimeError",
     )
-
-    assert response.status_code == 502
-    assert response.json() == {"detail": analyzer.ANALYSIS_GENERATION_FAILED_MESSAGE}
-    assert "private-proxy" not in response.text
-    assert "sk-sensitive-value" not in response.text
     assert len(llm_client.calls) == 1
 
 

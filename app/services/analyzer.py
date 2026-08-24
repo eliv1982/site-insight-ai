@@ -2,6 +2,7 @@
 
 import ipaddress
 import json
+import logging
 import re
 import socket
 import time
@@ -11,11 +12,15 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import requests
 from bs4 import BeautifulSoup
-from pydantic import BaseModel, ConfigDict, Field
+from openai import APIConnectionError, APIError, APIStatusError, APITimeoutError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from urllib3.exceptions import HTTPError as Urllib3HTTPError
 from urllib3.exceptions import ReadTimeoutError as Urllib3ReadTimeoutError
 
-from app.services.llm_client import LLMClient
+from app.services.llm_client import InvalidJSONResponse, LLMClient
+
+
+logger = logging.getLogger(__name__)
 
 
 CONNECT_TIMEOUT_SECONDS = 5.0
@@ -569,6 +574,28 @@ def _serialize_analysis_payload(url: str, cleaned_text: str) -> str:
     )
 
 
+def _log_analysis_failure(
+    category: str,
+    exception_class: str,
+    model: str,
+    *,
+    status_code: int | None = None,
+    validation_error_count: int | None = None,
+) -> None:
+    """Пишет одну безопасную запись без содержимого запроса, ответа или исключения."""
+    safe_facts = [
+        "event=analysis_generation_failed",
+        f"category={category}",
+        f"exception_class={exception_class}",
+        f"model={model}",
+    ]
+    if status_code is not None:
+        safe_facts.append(f"status_code={status_code}")
+    if validation_error_count is not None:
+        safe_facts.append(f"validation_error_count={validation_error_count}")
+    logger.error(" ".join(safe_facts))
+
+
 def run_site_analysis(url: str, llm_client: LLMClient) -> AnalyzeSiteResponse:
     """
     Выполняет анализ текста одной страницы одним структурированным запросом к LLM.
@@ -587,6 +614,7 @@ def run_site_analysis(url: str, llm_client: LLMClient) -> AnalyzeSiteResponse:
     html = fetch_html(url)
     cleaned_text = clean_html_to_text(html)
     user_payload = _serialize_analysis_payload(url, cleaned_text)
+    model = getattr(llm_client, "model", "unknown")
 
     try:
         model_response = llm_client.chat_json(
@@ -594,7 +622,41 @@ def run_site_analysis(url: str, llm_client: LLMClient) -> AnalyzeSiteResponse:
             user_prompt=user_payload,
             json_schema=ANALYSIS_JSON_SCHEMA,
         )
+    except (InvalidJSONResponse, json.JSONDecodeError) as exc:
+        _log_analysis_failure("json_decode_error", "JSONDecodeError", model)
+        raise AnalysisGenerationError() from exc
+    except APITimeoutError as exc:
+        _log_analysis_failure("llm_timeout", type(exc).__name__, model)
+        raise AnalysisGenerationError() from exc
+    except APIConnectionError as exc:
+        _log_analysis_failure("llm_connection_error", type(exc).__name__, model)
+        raise AnalysisGenerationError() from exc
+    except APIStatusError as exc:
+        _log_analysis_failure(
+            "llm_api_error",
+            type(exc).__name__,
+            model,
+            status_code=exc.status_code,
+        )
+        raise AnalysisGenerationError() from exc
+    except APIError as exc:
+        _log_analysis_failure("llm_api_error", type(exc).__name__, model)
+        raise AnalysisGenerationError() from exc
+    except Exception as exc:
+        _log_analysis_failure("unexpected_analysis_error", type(exc).__name__, model)
+        raise AnalysisGenerationError() from exc
+
+    try:
         final_analysis = SiteContentAnalysis.model_validate(model_response)
         return AnalyzeSiteResponse(url=url, final_analysis=final_analysis)
+    except ValidationError as exc:
+        _log_analysis_failure(
+            "schema_validation_error",
+            type(exc).__name__,
+            model,
+            validation_error_count=exc.error_count(),
+        )
+        raise AnalysisGenerationError() from exc
     except Exception as exc:
+        _log_analysis_failure("unexpected_analysis_error", type(exc).__name__, model)
         raise AnalysisGenerationError() from exc
