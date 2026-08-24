@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import inspect
 import ipaddress
 import socket
@@ -7,6 +8,7 @@ import socket
 import pytest
 import requests
 from fastapi import HTTPException
+from urllib3.exceptions import ProtocolError, ReadTimeoutError
 
 from app.routers import llm as llm_router
 from app.services import analyzer
@@ -16,26 +18,43 @@ PUBLIC_IPV4 = ipaddress.ip_address("93.184.216.34")
 PUBLIC_IPV6 = ipaddress.ip_address("2606:4700:4700::1111")
 
 
+class FakeRaw:
+    def __init__(self, chunks: tuple[bytes | BaseException, ...]) -> None:
+        self.chunks = chunks
+        self.stream_calls: list[tuple[int, bool | None]] = []
+
+    def stream(self, amount: int, decode_content: bool | None = None):
+        self.stream_calls.append((amount, decode_content))
+        assert amount == analyzer.DOWNLOAD_CHUNK_SIZE
+        assert decode_content is False
+        for chunk in self.chunks:
+            if isinstance(chunk, BaseException):
+                raise chunk
+            yield chunk
+
+
 class FakeResponse:
     def __init__(
         self,
         *,
         status_code: int = 200,
         headers: dict[str, str] | None = None,
-        chunks: tuple[bytes, ...] = (),
+        chunks: tuple[bytes | BaseException, ...] = (),
         encoding: str | None = "utf-8",
     ) -> None:
         self.status_code = status_code
         self.headers = requests.structures.CaseInsensitiveDict(headers or {})
         self.chunks = chunks
+        self.raw = FakeRaw(chunks)
         self.encoding = encoding
         self.closed = False
         self.iterated = False
 
     def iter_content(self, chunk_size: int):
         self.iterated = True
-        assert chunk_size == analyzer.DOWNLOAD_CHUNK_SIZE
-        yield from self.chunks
+        raise AssertionError(
+            f"automatic decoding via iter_content({chunk_size}) is forbidden"
+        )
 
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
@@ -100,6 +119,23 @@ def html_response(
     return FakeResponse(
         headers={"Content-Type": content_type},
         chunks=(body,),
+    )
+
+
+def gzip_response(
+    body: bytes,
+    *,
+    content_encoding: str = "gzip",
+    content_type: str = "text/html; charset=utf-8",
+    encoding: str | None = "utf-8",
+) -> FakeResponse:
+    return FakeResponse(
+        headers={
+            "Content-Type": content_type,
+            "Content-Encoding": content_encoding,
+        },
+        chunks=(gzip.compress(body),),
+        encoding=encoding,
     )
 
 
@@ -350,10 +386,59 @@ def test_oversized_content_length_is_rejected(monkeypatch):
         analyzer.fetch_html("https://public.example/")
 
     assert exc_info.value.status_code == 413
+    assert response.raw.stream_calls == []
     assert response.closed and session.closed
 
 
-def test_streamed_body_over_limit_is_rejected(monkeypatch):
+def test_identity_content_length_at_limit_is_not_rejected_early(monkeypatch):
+    allow_public_dns(monkeypatch)
+    response = FakeResponse(
+        headers={
+            "Content-Type": "text/html",
+            "Content-Length": str(analyzer.MAX_RESPONSE_BYTES),
+        },
+        chunks=(b"<html>identity boundary</html>",),
+    )
+    install_session(monkeypatch, response)
+
+    assert analyzer.fetch_html("https://public.example/") == (
+        "<html>identity boundary</html>"
+    )
+    assert response.raw.stream_calls == [(analyzer.DOWNLOAD_CHUNK_SIZE, False)]
+
+
+def test_gzip_content_length_at_limit_is_not_rejected_early(monkeypatch):
+    allow_public_dns(monkeypatch)
+    body = b"<html>gzip boundary</html>"
+    response = FakeResponse(
+        headers={
+            "Content-Type": "text/html",
+            "Content-Encoding": "gzip",
+            "Content-Length": str(analyzer.MAX_COMPRESSED_RESPONSE_BYTES),
+        },
+        chunks=(gzip.compress(body),),
+    )
+    install_session(monkeypatch, response)
+
+    assert analyzer.fetch_html("https://public.example/").encode() == body
+    assert response.raw.stream_calls == [(analyzer.DOWNLOAD_CHUNK_SIZE, False)]
+
+
+def test_identity_body_at_limit_is_accepted(monkeypatch):
+    allow_public_dns(monkeypatch)
+    body = b"x" * analyzer.MAX_RESPONSE_BYTES
+    response = FakeResponse(
+        headers={"Content-Type": "text/html"},
+        chunks=(body,),
+    )
+    install_session(monkeypatch, response)
+
+    assert analyzer.fetch_html("https://public.example/") == body.decode()
+    assert response.raw.stream_calls == [(analyzer.DOWNLOAD_CHUNK_SIZE, False)]
+    assert not response.iterated
+
+
+def test_identity_body_over_limit_is_rejected(monkeypatch):
     allow_public_dns(monkeypatch)
     response = FakeResponse(
         headers={"Content-Type": "text/html"},
@@ -365,6 +450,25 @@ def test_streamed_body_over_limit_is_rejected(monkeypatch):
         analyzer.fetch_html("https://public.example/", maximum_bytes=10)
 
     assert exc_info.value.status_code == 413
+
+
+@pytest.mark.parametrize("content_length", [None, "not-a-number"])
+def test_missing_or_invalid_content_length_still_uses_stream_limit(
+    monkeypatch,
+    content_length,
+):
+    allow_public_dns(monkeypatch)
+    headers = {"Content-Type": "text/html"}
+    if content_length is not None:
+        headers["Content-Length"] = content_length
+    response = FakeResponse(headers=headers, chunks=(b"123456",))
+    install_session(monkeypatch, response)
+
+    with pytest.raises(analyzer.SiteFetchError) as exc_info:
+        analyzer.fetch_html("https://public.example/", maximum_bytes=5)
+
+    assert exc_info.value.status_code == 413
+    assert response.raw.stream_calls == [(analyzer.DOWNLOAD_CHUNK_SIZE, False)]
 
 
 def test_unsupported_content_type_is_rejected(monkeypatch):
@@ -405,11 +509,24 @@ def test_identity_or_missing_content_encoding_is_accepted(monkeypatch, headers):
     install_session(monkeypatch, response)
 
     assert analyzer.fetch_html("https://public.example/") == "<html>ok</html>"
-    assert response.iterated
+    assert response.raw.stream_calls == [(analyzer.DOWNLOAD_CHUNK_SIZE, False)]
+    assert not response.iterated
 
 
-@pytest.mark.parametrize("content_encoding", ["gzip", "deflate", "br", "  GZip\t"])
-def test_compressed_content_encoding_is_rejected_before_iteration(
+@pytest.mark.parametrize(
+    "content_encoding",
+    [
+        "br",
+        "deflate",
+        "compress",
+        "x-gzip",
+        "unknown",
+        "gzip, br",
+        "gzip, identity",
+        "gzip, gzip",
+    ],
+)
+def test_unsupported_content_encoding_is_rejected_before_streaming(
     monkeypatch,
     content_encoding,
 ):
@@ -426,7 +543,239 @@ def test_compressed_content_encoding_is_rejected_before_iteration(
     assert exc_info.value.status_code == 415
     assert exc_info.value.public_message == analyzer.UNSUPPORTED_CONTENT_ENCODING_MESSAGE
     assert not response.iterated
+    assert response.raw.stream_calls == []
     assert response.closed and session.closed
+
+
+@pytest.mark.parametrize("content_encoding", ["gzip", "  GZip\t"])
+def test_valid_gzip_html_is_decoded_from_raw_stream(monkeypatch, content_encoding):
+    allow_public_dns(monkeypatch)
+    body = b"<html><body>gzip works</body></html>"
+    response = gzip_response(body, content_encoding=content_encoding)
+    install_session(monkeypatch, response)
+
+    html = analyzer.fetch_html("https://public.example/")
+
+    assert html.encode("utf-8") == body
+    assert response.raw.stream_calls == [(analyzer.DOWNLOAD_CHUNK_SIZE, False)]
+    assert not response.iterated
+
+
+def test_valid_gzip_is_decoded_across_multiple_raw_chunks(monkeypatch):
+    allow_public_dns(monkeypatch)
+    body = b"<html><body>split gzip stream</body></html>"
+    compressed = gzip.compress(body)
+    response = FakeResponse(
+        headers={"Content-Type": "text/html", "Content-Encoding": "gzip"},
+        chunks=tuple(compressed[index : index + 3] for index in range(0, len(compressed), 3)),
+    )
+    install_session(monkeypatch, response)
+
+    assert analyzer.fetch_html("https://public.example/").encode() == body
+
+
+def test_gzip_charset_handling_matches_identity(monkeypatch):
+    allow_public_dns(monkeypatch)
+    body = "<html><body>Привет</body></html>".encode("cp1251")
+    response = gzip_response(
+        body,
+        content_type="text/html; charset=windows-1251",
+        encoding="cp1251",
+    )
+    install_session(monkeypatch, response)
+
+    html = analyzer.fetch_html("https://public.example/")
+
+    assert html.encode("cp1251") == body
+    assert "Привет" in html
+
+
+def test_gzip_decoded_body_at_limit_is_accepted_with_positive_output_bounds(
+    monkeypatch,
+):
+    allow_public_dns(monkeypatch)
+    body = b"x" * analyzer.MAX_RESPONSE_BYTES
+    response = gzip_response(body)
+    real_decompressobj = analyzer.zlib.decompressobj
+    output_limits = []
+
+    class OutputLimitRecorder:
+        def __init__(self, wbits):
+            self._wrapped = real_decompressobj(wbits)
+
+        def __getattr__(self, name):
+            return getattr(self._wrapped, name)
+
+        def decompress(self, data, max_length):
+            output_limits.append(max_length)
+            return self._wrapped.decompress(data, max_length)
+
+    monkeypatch.setattr(analyzer.zlib, "decompressobj", OutputLimitRecorder)
+    install_session(monkeypatch, response)
+
+    assert analyzer.fetch_html("https://public.example/") == body.decode()
+    assert output_limits
+    assert all(1 <= limit <= analyzer.DOWNLOAD_CHUNK_SIZE for limit in output_limits)
+
+
+def test_gzip_bomb_over_decoded_limit_is_rejected(monkeypatch):
+    allow_public_dns(monkeypatch)
+    body = b"x" * (analyzer.MAX_RESPONSE_BYTES + 1)
+    compressed = gzip.compress(body)
+    assert len(compressed) < analyzer.MAX_COMPRESSED_RESPONSE_BYTES
+    response = FakeResponse(
+        headers={"Content-Type": "text/html", "Content-Encoding": "gzip"},
+        chunks=(compressed,),
+    )
+    install_session(monkeypatch, response)
+
+    with pytest.raises(analyzer.SiteFetchError) as exc_info:
+        analyzer.fetch_html("https://public.example/")
+
+    assert exc_info.value.status_code == 413
+    assert exc_info.value.public_message == analyzer.RESPONSE_TOO_LARGE_MESSAGE
+
+
+def test_gzip_compressed_limit_is_checked_before_decompression(monkeypatch):
+    allow_public_dns(monkeypatch)
+    compressed = gzip.compress(b"<html>small decoded body</html>")
+    monkeypatch.setattr(analyzer, "MAX_COMPRESSED_RESPONSE_BYTES", len(compressed) - 1)
+
+    class MustNotDecompress:
+        eof = False
+        unused_data = b""
+        unconsumed_tail = b""
+
+        def decompress(self, _data, _max_length):
+            pytest.fail("compressed over-limit data reached zlib")
+
+    monkeypatch.setattr(
+        analyzer.zlib,
+        "decompressobj",
+        lambda _wbits: MustNotDecompress(),
+    )
+    response = FakeResponse(
+        headers={"Content-Type": "text/html", "Content-Encoding": "gzip"},
+        chunks=(compressed,),
+    )
+    install_session(monkeypatch, response)
+
+    with pytest.raises(analyzer.SiteFetchError) as exc_info:
+        analyzer.fetch_html("https://public.example/")
+
+    assert exc_info.value.status_code == 413
+
+
+def test_gzip_body_at_compressed_limit_is_accepted(monkeypatch):
+    allow_public_dns(monkeypatch)
+    body = b"<html>compressed boundary</html>"
+    compressed = gzip.compress(body)
+    monkeypatch.setattr(analyzer, "MAX_COMPRESSED_RESPONSE_BYTES", len(compressed))
+    response = FakeResponse(
+        headers={"Content-Type": "text/html", "Content-Encoding": "gzip"},
+        chunks=(compressed,),
+    )
+    install_session(monkeypatch, response)
+
+    assert analyzer.fetch_html("https://public.example/").encode() == body
+
+
+def test_gzip_content_length_uses_compressed_limit(monkeypatch):
+    allow_public_dns(monkeypatch)
+    monkeypatch.setattr(analyzer, "MAX_COMPRESSED_RESPONSE_BYTES", 10)
+    response = FakeResponse(
+        headers={
+            "Content-Type": "text/html",
+            "Content-Encoding": "gzip",
+            "Content-Length": "11",
+        },
+        chunks=(gzip.compress(b"ok"),),
+    )
+    install_session(monkeypatch, response)
+
+    with pytest.raises(analyzer.SiteFetchError) as exc_info:
+        analyzer.fetch_html("https://public.example/")
+
+    assert exc_info.value.status_code == 413
+    assert response.raw.stream_calls == []
+
+
+def _corrupt_gzip(body: bytes) -> bytes:
+    compressed = bytearray(gzip.compress(body))
+    compressed[-1] ^= 0xFF
+    return bytes(compressed)
+
+
+@pytest.mark.parametrize(
+    "compressed",
+    [
+        pytest.param(b"not a gzip stream", id="malformed"),
+        pytest.param(_corrupt_gzip(b"<html>checksum</html>"), id="corrupt-checksum"),
+        pytest.param(gzip.compress(b"<html>truncated</html>")[:-8], id="truncated"),
+        pytest.param(
+            gzip.compress(b"<html>first</html>")
+            + gzip.compress(b"<html>second</html>"),
+            id="concatenated-members",
+        ),
+        pytest.param(
+            gzip.compress(b"<html>first</html>") + b"trailing garbage",
+            id="trailing-garbage",
+        ),
+    ],
+)
+def test_invalid_gzip_is_sanitized(monkeypatch, compressed):
+    allow_public_dns(monkeypatch)
+    response = FakeResponse(
+        headers={"Content-Type": "text/html", "Content-Encoding": "gzip"},
+        chunks=(compressed,),
+    )
+    install_session(monkeypatch, response)
+
+    with pytest.raises(analyzer.SiteFetchError) as exc_info:
+        analyzer.fetch_html("https://public.example/")
+
+    assert exc_info.value.status_code == 502
+    assert exc_info.value.public_message == analyzer.FETCH_FAILED_MESSAGE
+    assert str(exc_info.value) == analyzer.FETCH_FAILED_MESSAGE
+
+
+def test_gzip_rejects_a_second_member_in_a_later_raw_chunk(monkeypatch):
+    allow_public_dns(monkeypatch)
+    response = FakeResponse(
+        headers={"Content-Type": "text/html", "Content-Encoding": "gzip"},
+        chunks=(gzip.compress(b"first"), gzip.compress(b"second")),
+    )
+    install_session(monkeypatch, response)
+
+    with pytest.raises(analyzer.SiteFetchError) as exc_info:
+        analyzer.fetch_html("https://public.example/")
+
+    assert exc_info.value.status_code == 502
+    assert exc_info.value.public_message == analyzer.FETCH_FAILED_MESSAGE
+
+
+def test_gzip_reader_never_calls_unbounded_flush(monkeypatch):
+    allow_public_dns(monkeypatch)
+    real_decompressobj = analyzer.zlib.decompressobj
+
+    class FlushGuard:
+        def __init__(self, wbits):
+            self._wrapped = real_decompressobj(wbits)
+
+        def __getattr__(self, name):
+            return getattr(self._wrapped, name)
+
+        def decompress(self, data, max_length):
+            return self._wrapped.decompress(data, max_length)
+
+        def flush(self, *_args, **_kwargs):
+            pytest.fail("gzip reader called flush()")
+
+    monkeypatch.setattr(analyzer.zlib, "decompressobj", FlushGuard)
+    response = gzip_response(b"<html>bounded</html>")
+    install_session(monkeypatch, response)
+
+    assert analyzer.fetch_html("https://public.example/") == "<html>bounded</html>"
 
 
 @pytest.mark.parametrize("content_type", ["text/html", "application/xhtml+xml"])
@@ -459,6 +808,88 @@ def test_network_failure_is_sanitized(monkeypatch):
     assert exc_info.value.public_message == analyzer.FETCH_FAILED_MESSAGE
     assert "10.0.0.8" not in str(exc_info.value)
     assert session.closed
+
+
+def test_request_timeout_maps_to_504(monkeypatch):
+    allow_public_dns(monkeypatch)
+    install_session(monkeypatch, requests.Timeout("raw timeout detail"))
+
+    with pytest.raises(analyzer.SiteFetchError) as exc_info:
+        analyzer.fetch_html("https://public.example/")
+
+    assert exc_info.value.status_code == 504
+    assert exc_info.value.public_message == analyzer.FETCH_TIMEOUT_MESSAGE
+    assert "raw timeout detail" not in str(exc_info.value)
+
+
+def test_raw_stream_timeout_maps_to_504(monkeypatch):
+    allow_public_dns(monkeypatch)
+    response = FakeResponse(
+        headers={"Content-Type": "text/html"},
+        chunks=(ReadTimeoutError(None, "https://public.example/", "raw detail"),),
+    )
+    install_session(monkeypatch, response)
+
+    with pytest.raises(analyzer.SiteFetchError) as exc_info:
+        analyzer.fetch_html("https://public.example/")
+
+    assert exc_info.value.status_code == 504
+    assert exc_info.value.public_message == analyzer.FETCH_TIMEOUT_MESSAGE
+    assert "raw detail" not in str(exc_info.value)
+
+
+def test_raw_protocol_failure_is_sanitized(monkeypatch):
+    allow_public_dns(monkeypatch)
+    response = FakeResponse(
+        headers={"Content-Type": "text/html"},
+        chunks=(ProtocolError("raw protocol detail"),),
+    )
+    install_session(monkeypatch, response)
+
+    with pytest.raises(analyzer.SiteFetchError) as exc_info:
+        analyzer.fetch_html("https://public.example/")
+
+    assert exc_info.value.status_code == 502
+    assert exc_info.value.public_message == analyzer.FETCH_FAILED_MESSAGE
+    assert "raw protocol detail" not in str(exc_info.value)
+
+
+def test_gzip_failure_does_not_call_llm(monkeypatch):
+    allow_public_dns(monkeypatch)
+    response = FakeResponse(
+        headers={"Content-Type": "text/html", "Content-Encoding": "gzip"},
+        chunks=(b"malformed gzip",),
+    )
+    install_session(monkeypatch, response)
+
+    class LLMCallGuard:
+        def chat_json(self, *_args, **_kwargs):
+            pytest.fail("LLM call reached after gzip failure")
+
+    with pytest.raises(analyzer.SiteFetchError) as exc_info:
+        analyzer.run_site_analysis("https://public.example/", LLMCallGuard())
+
+    assert exc_info.value.status_code == 502
+    assert exc_info.value.public_message == analyzer.FETCH_FAILED_MESSAGE
+
+
+def test_empty_gzip_failure_does_not_call_llm(monkeypatch):
+    allow_public_dns(monkeypatch)
+    response = FakeResponse(
+        headers={"Content-Type": "text/html", "Content-Encoding": "gzip"},
+        chunks=(),
+    )
+    install_session(monkeypatch, response)
+
+    class LLMCallGuard:
+        def chat_json(self, *_args, **_kwargs):
+            pytest.fail("LLM call reached after empty gzip failure")
+
+    with pytest.raises(analyzer.SiteFetchError) as exc_info:
+        analyzer.run_site_analysis("https://public.example/", LLMCallGuard())
+
+    assert exc_info.value.status_code == 502
+    assert exc_info.value.public_message == analyzer.FETCH_FAILED_MESSAGE
 
 
 def test_analyze_site_returns_sanitized_fetch_error(monkeypatch):

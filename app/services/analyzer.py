@@ -5,12 +5,15 @@ import json
 import re
 import socket
 import time
-from typing import Annotated
+import zlib
+from typing import Annotated, Iterator
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import requests
 from bs4 import BeautifulSoup
 from pydantic import BaseModel, ConfigDict, Field
+from urllib3.exceptions import HTTPError as Urllib3HTTPError
+from urllib3.exceptions import ReadTimeoutError as Urllib3ReadTimeoutError
 
 from app.services.llm_client import LLMClient
 
@@ -20,6 +23,7 @@ READ_TIMEOUT_SECONDS = 15.0
 TOTAL_FETCH_TIMEOUT_SECONDS = 30.0
 MAX_REDIRECTS = 3
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+MAX_COMPRESSED_RESPONSE_BYTES = 2 * 1024 * 1024
 DOWNLOAD_CHUNK_SIZE = 64 * 1024
 MAX_ANALYSIS_TEXT_CHARACTERS = 50_000
 
@@ -315,10 +319,15 @@ def _validated_content_type(response: requests.Response) -> None:
         raise SiteFetchError(UNSUPPORTED_CONTENT_TYPE_MESSAGE, status_code=415)
 
 
-def _validated_content_encoding(response: requests.Response) -> None:
+def _validated_content_encoding(response: requests.Response) -> str:
     content_encoding = response.headers.get("Content-Encoding")
-    if content_encoding is not None and content_encoding.strip().lower() != "identity":
+    if content_encoding is None:
+        return "identity"
+
+    normalized_encoding = content_encoding.strip().lower()
+    if normalized_encoding not in {"identity", "gzip"}:
         raise SiteFetchError(UNSUPPORTED_CONTENT_ENCODING_MESSAGE, status_code=415)
+    return normalized_encoding
 
 
 def _reject_oversized_content_length(
@@ -336,26 +345,104 @@ def _reject_oversized_content_length(
         raise SiteFetchError(RESPONSE_TOO_LARGE_MESSAGE, status_code=413)
 
 
-def _read_bounded_body(
+def _iter_raw_response_chunks(
+    response: requests.Response,
+    deadline: float,
+) -> Iterator[bytes]:
+    try:
+        for chunk in response.raw.stream(
+            DOWNLOAD_CHUNK_SIZE,
+            decode_content=False,
+        ):
+            if time.monotonic() > deadline:
+                raise SiteFetchError(FETCH_TIMEOUT_MESSAGE, status_code=504)
+            if chunk:
+                yield chunk
+    except SiteFetchError:
+        raise
+    except (requests.Timeout, Urllib3ReadTimeoutError, TimeoutError) as exc:
+        raise SiteFetchError(FETCH_TIMEOUT_MESSAGE, status_code=504) from exc
+    except (requests.RequestException, Urllib3HTTPError, OSError) as exc:
+        raise SiteFetchError(FETCH_FAILED_MESSAGE, status_code=502) from exc
+
+
+def _read_bounded_identity_body(
     response: requests.Response,
     maximum_bytes: int,
     deadline: float,
 ) -> bytes:
     chunks: list[bytes] = []
     downloaded = 0
-    try:
-        for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
+    for chunk in _iter_raw_response_chunks(response, deadline):
+        downloaded += len(chunk)
+        if downloaded > maximum_bytes:
+            raise SiteFetchError(RESPONSE_TOO_LARGE_MESSAGE, status_code=413)
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _invalid_gzip_error() -> SiteFetchError:
+    return SiteFetchError(FETCH_FAILED_MESSAGE, status_code=502)
+
+
+def _read_bounded_gzip_body(
+    response: requests.Response,
+    maximum_bytes: int,
+    deadline: float,
+) -> bytes:
+    decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    decoded_chunks: list[bytes] = []
+    compressed_size = 0
+    decoded_size = 0
+
+    for chunk in _iter_raw_response_chunks(response, deadline):
+        compressed_size += len(chunk)
+        if compressed_size > MAX_COMPRESSED_RESPONSE_BYTES:
+            raise SiteFetchError(RESPONSE_TOO_LARGE_MESSAGE, status_code=413)
+        if decompressor.eof:
+            raise _invalid_gzip_error()
+
+        pending = chunk
+        while pending:
+            previous_pending_size = len(pending)
+            remaining_with_overflow_sentinel = maximum_bytes - decoded_size + 1
+            if remaining_with_overflow_sentinel < 1:
+                raise SiteFetchError(RESPONSE_TOO_LARGE_MESSAGE, status_code=413)
+            output_limit = min(
+                DOWNLOAD_CHUNK_SIZE,
+                remaining_with_overflow_sentinel,
+            )
+            try:
+                decoded = decompressor.decompress(pending, output_limit)
+            except zlib.error as exc:
+                raise _invalid_gzip_error() from exc
+
+            if len(decoded) > maximum_bytes - decoded_size:
+                raise SiteFetchError(RESPONSE_TOO_LARGE_MESSAGE, status_code=413)
+            if decompressor.unused_data:
+                raise _invalid_gzip_error()
+
+            decoded_size += len(decoded)
+            if decoded:
+                decoded_chunks.append(decoded)
+
             if time.monotonic() > deadline:
                 raise SiteFetchError(FETCH_TIMEOUT_MESSAGE, status_code=504)
-            if not chunk:
-                continue
-            downloaded += len(chunk)
-            if downloaded > maximum_bytes:
-                raise SiteFetchError(RESPONSE_TOO_LARGE_MESSAGE, status_code=413)
-            chunks.append(chunk)
-    except requests.RequestException as exc:
-        raise SiteFetchError(FETCH_FAILED_MESSAGE, status_code=502) from exc
-    return b"".join(chunks)
+
+            unconsumed = decompressor.unconsumed_tail
+            if not unconsumed:
+                break
+            if len(unconsumed) == previous_pending_size and not decoded:
+                raise _invalid_gzip_error()
+            pending = unconsumed
+
+    if (
+        not decompressor.eof
+        or decompressor.unused_data
+        or decompressor.unconsumed_tail
+    ):
+        raise _invalid_gzip_error()
+    return b"".join(decoded_chunks)
 
 
 def _decode_html(body: bytes, response: requests.Response) -> str:
@@ -399,11 +486,13 @@ def fetch_html(
                     stream=True,
                     headers=_FETCH_HEADERS,
                 )
+            except requests.Timeout as exc:
+                raise SiteFetchError(FETCH_TIMEOUT_MESSAGE, status_code=504) from exc
             except (requests.RequestException, OSError) as exc:
                 raise SiteFetchError(FETCH_FAILED_MESSAGE, status_code=502) from exc
 
             try:
-                _validated_content_encoding(response)
+                content_encoding = _validated_content_encoding(response)
                 try:
                     response.raise_for_status()
                 except requests.RequestException as exc:
@@ -425,8 +514,16 @@ def fetch_html(
                     continue
 
                 _validated_content_type(response)
-                _reject_oversized_content_length(response, maximum_bytes)
-                body = _read_bounded_body(response, maximum_bytes, deadline)
+                content_length_limit = (
+                    MAX_COMPRESSED_RESPONSE_BYTES
+                    if content_encoding == "gzip"
+                    else maximum_bytes
+                )
+                _reject_oversized_content_length(response, content_length_limit)
+                if content_encoding == "gzip":
+                    body = _read_bounded_gzip_body(response, maximum_bytes, deadline)
+                else:
+                    body = _read_bounded_identity_body(response, maximum_bytes, deadline)
                 return _decode_html(body, response)
             finally:
                 response.close()
