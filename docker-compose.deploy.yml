@@ -1,32 +1,77 @@
-# Deploy: docker compose -f docker-compose.deploy.yml up -d
-# Keep this file in same folder as .env
-name: app-deploy
+name: site-insight-ai
+
+x-runtime-hardening: &runtime-hardening
+  restart: unless-stopped
+  read_only: true
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
 
 services:
   backend:
-    image: eliv1982/backend:latest
-    container_name: backend
-    ports:
-      - "8000:8000"
+    <<: *runtime-hardening
+    build:
+      context: .
+      dockerfile: Backend-Dockerfile
+    image: site-insight-ai-backend:${IMAGE_TAG:?IMAGE_TAG is required}
     env_file:
-      - .env
+      - ${BACKEND_ENV_FILE:-.env}
+    expose:
+      - "8000"
     networks:
-      - app-network
-    restart: unless-stopped
+      - app
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/health", timeout=2).read()
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    pids_limit: 150
+    mem_limit: 512m
+    cpus: 1.0
 
   frontend:
-    image: eliv1982/frontend:latest
-    container_name: frontend
-    ports:
-      - "5173:5173"
-    environment:
-      - VITE_API_URL=/api
+    <<: *runtime-hardening
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      target: production
+    image: site-insight-ai-frontend:${IMAGE_TAG:?IMAGE_TAG is required}
+    expose:
+      - "8080"
     networks:
-      - app-network
+      - app
+      - proxy
     depends_on:
-      - backend
-    restart: unless-stopped
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "-T", "2", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    pids_limit: 50
+    mem_limit: 128m
+    cpus: 0.5
 
 networks:
-  app-network:
+  app:
     driver: bridge
+  proxy:
+    external: true
+    name: ${PROXY_NETWORK:?PROXY_NETWORK is required}
