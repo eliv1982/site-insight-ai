@@ -1,10 +1,10 @@
-"""
-FastAPI-приложение для работы с LLM.
-Запуск: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-"""
+"""FastAPI-приложение для работы с LLM."""
+
+from typing import Literal
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 from app.routers import llm
 
@@ -22,6 +22,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(llm.router, prefix="/llm", tags=["llm"])
+
+
+class HealthResponse(BaseModel):
+    """Stable response contract for process liveness checks."""
+
+    status: Literal["ok"]
+
+
+@app.get("/health", response_model=HealthResponse, tags=["health"])
+def health() -> HealthResponse:
+    """Report process liveness without touching external dependencies."""
+    return HealthResponse(status="ok")
 
 
 @app.get("/")
