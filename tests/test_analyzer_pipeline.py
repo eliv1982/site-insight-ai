@@ -441,7 +441,7 @@ def test_invalid_analysis_schema_logs_only_safe_validation_facts(monkeypatch, ca
     assert len(llm_client.calls) == 1
 
 
-def test_proxy_failure_returns_only_sanitized_api_error(monkeypatch, caplog):
+def test_provider_failure_returns_only_sanitized_api_error(monkeypatch, caplog):
     caplog.set_level(logging.ERROR, logger=analyzer.__name__)
     sensitive_error = RuntimeError(
         (

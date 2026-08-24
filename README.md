@@ -2,13 +2,17 @@
 
 Site Insight AI is a focused web application that fetches one public HTML page, extracts its readable text, and returns a validated, structured analysis from a single LLM call. The result describes what the page says; it does not inspect the rest of the site or verify the page's claims.
 
+![Site Insight AI showing structured analysis of the Django overview page](assets/site-insight-ai-django-analysis.png)
+
+*Structured analysis of the Django overview page, captured during deployment verification.*
+
 ## What it does
 
 1. Accepts the URL of one public webpage.
 2. Validates and fetches the page with bounded, SSRF-aware network handling.
 3. Removes scripts, styles, and HTML markup from the response.
-4. Sends the bounded page text to an OpenAI-compatible API in one structured request.
-5. Validates the model response with strict Pydantic models before returning it.
+4. Requests structured JSON output from an OpenAI-compatible API in one LLM call.
+5. Parses and validates the JSON response with strict Pydantic models before returning it.
 
 See [final_analyze_example.json](final_analyze_example.json) for an example response.
 
@@ -66,7 +70,7 @@ Successful responses contain the normalized input `url` and a `final_analysis` o
 - Local, private, reserved, link-local, and otherwise non-global resolved addresses are rejected.
 - Redirects are followed manually, bounded, and revalidated at every hop.
 - Only HTML/XHTML responses are accepted; response size, application-level fetch time, redirect count, and analysis text length are bounded.
-- Non-identity content encodings are rejected so compressed responses cannot bypass the byte limit.
+- Identity and `gzip` response bodies are read with bounded byte limits; unsupported content encodings are rejected.
 - Page URLs and text are serialized as untrusted prompt data, with explicit instructions not to follow instructions embedded in that data.
 - Model output must match strict Pydantic types, fields, list sizes, and string limits.
 
@@ -91,7 +95,9 @@ Vite proxies `/api` to the backend. Backend `--reload` and the Vite development 
 
 Stop the development stack with `docker compose down`.
 
-## Production/demo deployment
+## Deployment
+
+Docker/VPS deployment has been successfully verified end to end. No public demo is currently hosted.
 
 Production requires an external reverse proxy/TLS service and an existing shared Docker network. The production Compose file publishes no application ports: the proxy reaches frontend nginx on port 8080, while the backend remains internal on port 8000.
 
@@ -104,11 +110,20 @@ Backend runtime values belong in `.env`:
 | Variable | Role |
 | --- | --- |
 | `OPENAI_API_KEY` | Canonical OpenAI-compatible provider credential |
-| `API_KEY` | Compatibility fallback when `OPENAI_API_KEY` is absent |
-| `BASE_URL` | Canonical OpenAI-compatible API base URL |
-| `PROXY_API_URL` | Compatibility fallback when `BASE_URL` is absent |
+| `OPENAI_MODEL` | Model name; defaults to `gpt-4o` when unset |
+| `BASE_URL` | Canonical OpenAI-compatible API endpoint |
+| `API_KEY` | Legacy compatibility fallback when `OPENAI_API_KEY` is absent |
+| `PROXY_API_URL` | Legacy compatibility fallback when `BASE_URL` is absent |
 
-The model is not selected by an environment variable; the current code default is `gpt-4o`.
+For official OpenAI, use:
+
+```env
+OPENAI_API_KEY=replace-with-openai-api-key
+OPENAI_MODEL=gpt-4o
+BASE_URL=https://api.openai.com/v1
+```
+
+When neither endpoint variable is configured, the OpenAI SDK uses its official default endpoint. Set `BASE_URL` explicitly for other OpenAI-compatible providers.
 
 The frontend also recognizes optional `VITE_API_URL` during development/build. When it is empty or unset—as in the committed development Compose configuration—the client uses the same-origin `/api` path. It is not a backend secret and does not belong in backend `.env`.
 
@@ -129,7 +144,7 @@ Backend:
 python -m pytest
 ```
 
-The current suite contains 73 tests.
+The backend suite contains more than 100 collected test cases covering fetch safety, analysis validation, and API routes.
 
 Frontend, using Node.js 24:
 
@@ -143,4 +158,4 @@ npm audit --omit=dev
 
 ## Repository status and scope
 
-This is a portfolio-ready, hardened course project with an intentionally narrow scope: structured analysis of one public webpage. Ideas such as crawling, browser rendering, audits, or analytics are not implemented features.
+The project intentionally focuses on structured analysis of one public webpage. Ideas such as crawling, browser rendering, audits, or analytics are not implemented features.

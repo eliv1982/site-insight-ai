@@ -10,7 +10,7 @@ from app.routers import llm
 
 app = FastAPI(
     title="LLM API",
-    description="API для работы с LLM через Proxy API",
+    description="API для структурированного LLM-анализа веб-страниц",
     version="1.0.0",
 )
 

@@ -1,6 +1,6 @@
 # Deployment
 
-This guide describes the current production/demo workflow for Site Insight AI. It builds explicitly tagged application images from a trusted Git checkout and connects them to an externally managed reverse proxy. It does not use a registry-driven `latest` workflow or unattended updates.
+This guide describes a reusable production deployment procedure for Site Insight AI. It builds explicitly tagged application images from a trusted Git checkout and connects them to an externally managed reverse proxy. It does not use a registry-driven `latest` workflow or unattended updates.
 
 ## Architecture
 
@@ -59,7 +59,17 @@ cp .env.example .env
 chmod 600 .env
 ```
 
-Edit `.env` and replace its placeholders with the OpenAI-compatible provider values for this deployment. The file contains backend runtime configuration and secrets only. It is ignored by Git, must never be committed, and should remain readable only by the deployment account where practical.
+Edit `.env` and replace its placeholders with the provider values for this deployment. Official OpenAI configuration uses:
+
+```env
+OPENAI_API_KEY=replace-with-openai-api-key
+OPENAI_MODEL=gpt-4o
+BASE_URL=https://api.openai.com/v1
+```
+
+`BASE_URL` is the canonical endpoint variable. `PROXY_API_URL` remains a legacy compatibility fallback when `BASE_URL` is absent; if neither endpoint variable is set, the OpenAI SDK uses its official default endpoint. `API_KEY` is likewise a legacy fallback for `OPENAI_API_KEY`. For other OpenAI-compatible providers, set `BASE_URL` to that provider's API endpoint.
+
+The file contains backend runtime configuration and secrets only. It is ignored by Git, must never be committed, and should remain readable only by the deployment account where practical.
 
 Do not put `PROXY_NETWORK` or `IMAGE_TAG` in `.env`. They are deployment inputs supplied through the invoking shell, CI job, or deployment environment. `deploy.sh` checks that `.env` exists but does not source or print it.
 
