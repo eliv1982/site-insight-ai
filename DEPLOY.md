@@ -35,7 +35,7 @@ No Docker Hub account or application-port firewall rule is required by this work
 Clone the repository into a deployment directory:
 
 ```sh
-git clone https://github.com/OWNER/site-insight-ai.git
+git clone https://github.com/eliv1982/site-insight-ai.git
 cd site-insight-ai
 ```
 
