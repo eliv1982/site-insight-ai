@@ -68,6 +68,4 @@ temp/
 *.md
 docker-compose*.yml
 deploy.sh
-update-containers.sh
-cron.docker-update.example
 final_analyze_example.json

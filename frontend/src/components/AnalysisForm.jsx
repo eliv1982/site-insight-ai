@@ -19,7 +19,7 @@ export function AnalysisForm({ onSubmit, disabled }) {
       onSubmit={handleSubmit}
     >
       <label className="mb-2 block text-sm font-medium text-slate-600">
-        Введите URL сайта для анализа
+        Введите URL публичной веб-страницы
       </label>
       <div className="flex flex-col gap-3 sm:flex-row sm:gap-4">
         <input
@@ -29,14 +29,14 @@ export function AnalysisForm({ onSubmit, disabled }) {
           placeholder="https://example.com"
           className="flex-1 rounded-xl border border-slate-200 bg-white px-4 py-3.5 text-slate-900 shadow-sm transition focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
           disabled={disabled}
-          aria-label="URL сайта для анализа"
+          aria-label="URL публичной веб-страницы"
         />
         <button
           type="submit"
           disabled={disabled || !url.trim()}
           className="shrink-0 rounded-xl bg-indigo-600 px-6 py-3.5 font-medium text-white shadow-md transition hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50"
         >
-          Анализировать сайт
+          Анализировать страницу
         </button>
       </div>
     </motion.form>

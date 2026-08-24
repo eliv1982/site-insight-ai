@@ -1,480 +1,277 @@
-# Полная инструкция по деплою на сервер
+# Deployment
 
-Пошаговое руководство: от подключения к серверу до запуска приложения и настройки автообновления контейнеров из Docker Hub.
+This guide describes the current production/demo workflow for Site Insight AI. It builds explicitly tagged application images from a trusted Git checkout and connects them to an externally managed reverse proxy. It does not use a registry-driven `latest` workflow or unattended updates.
 
-**Как пользоваться:** у каждого шага указано **Где** выполнять (ваш ПК или сервер) и **что вводить в терминал**. Копируйте команды по одной; каждая команда — одна строка (включая точку `.` в конце, где она есть).
+## Architecture
 
----
-
-## Содержание
-
-1. [Что нужно заранее](#1-что-нужно-заранее)
-2. [Подключение к серверу](#2-подключение-к-серверу)
-3. [Проверка Docker на сервере](#3-проверка-docker-на-сервере)
-4. [Размещение проекта на сервере](#4-размещение-проекта-на-сервере)
-5. [Сборка и публикация образов в Docker Hub](#5-сборка-и-публикация-образов-в-docker-hub)
-6. [Настройка окружения на сервере](#6-настройка-окружения-на-сервере)
-7. [Первый запуск приложения](#7-первый-запуск-приложения)
-8. [Проверка работы](#8-проверка-работы)
-9. [Автообновление контейнеров](#9-автообновление-контейнеров)
-10. [Полезные команды](#10-полезные-команды)
-
----
-
-## 1. Что нужно заранее
-
-- **Сервер** с установленными Docker и Docker Compose (Linux).
-- **Доступ по SSH**: IP или домен сервера, имя пользователя и **пароль** (подключение по паролю).
-- **Аккаунт Docker Hub** (ник: `eliv1982` или ваш).
-- **Локально**: Git (если деплой через репозиторий) или возможность скопировать файлы на сервер.
-
----
-
-## 2. Подключение к серверу
-
-**Где:** ваш ПК (PowerShell или CMD). Подключение по **паролю**.
-
-### 2.1. Подключение по SSH
-
-В терминале введите **одну** команду (подставьте свой логин и IP или домен):
-
-```
-ssh root@85.198.69.132
-```
-
-Или, например: `ssh ubuntu@85.198.69.132`
-
-1. При первом подключении введите `yes` и нажмите Enter.
-2. Когда появится запрос пароля — введите пароль (символы не отображаются), нажмите Enter.
-
-После входа вы в терминале **сервера**. Дальше в разделах будет указано: команды «на сервере» или «на ПК».
-
-### 2.2. Копирование файлов на сервер (SCP) — тоже по паролю
-
-При копировании файлов с ПК на сервер через `scp` будет запрошен **тот же пароль** пользователя. Команды вводите на своём компьютере; когда появится запрос пароля, введите пароль от учётной записи на сервере.
-
-### 2.3. Подключение по SSH-ключу (опционально)
-
-Если позже настроите вход по ключу, используйте:
-
-```bash
-ssh -i "C:\Users\ВашеИмя\.ssh\id_rsa" username@IP_ИЛИ_ДОМЕН
-```
-
-На Linux/macOS: `ssh -i ~/.ssh/id_rsa username@IP_ИЛИ_ДОМЕН`
-
-### 2.4. Если SSH не подключается
-
-- Проверьте, что на сервере запущен SSH (порт 22).
-- Проверьте firewall: порт 22 должен быть открыт.
-- Убедитесь, что логин и пароль верные (учтите раскладку и Caps Lock).
-
----
-
-## 3. Проверка Docker на сервере
-
-**Где:** сервер (вы уже подключены по SSH).
-
-Введите по очереди:
-
-```
-docker --version
-```
-
-```
-docker compose version
-```
-
-Ожидаемо что-то вроде:
-- `Docker version 24.x.x`
-- `Docker Compose version v2.x.x`
-
-Если команд нет — установите Docker по [официальной инструкции](https://docs.docker.com/engine/install/) для вашего дистрибутива (Ubuntu, Debian и т.д.). После установки Docker Compose обычно доступен как `docker compose`.
-
----
-
-## 4. Размещение проекта на сервере
-
-**Где:** сначала сервер (создать каталог), потом ваш ПК (скопировать файлы).
-
-На сервере должны лежать в одном каталоге:
-
-- `docker-compose.deploy.yml`
-- `deploy.sh` — первый запуск/перезапуск приложения
-- `update-containers.sh` — автообновление образов по расписанию
-- файл `.env` (создаётся в шаге 6)
-
-### Вариант A: Клонирование репозитория (если проект в Git)
-
-**Где:** сервер. Команды по одной:
-
-```
-cd /opt
-```
-
-```
-sudo git clone https://github.com/ВАШ_НИК/ВАШ_РЕПОЗИТОРИЙ.git final-project
-```
-
-```
-cd final-project
-```
-
-(Замените URL на свой репозиторий.)
-
-### Вариант B: Копирование файлов с вашего компьютера (SCP)
-
-**Важно для Windows:** путь с `C:\` и пробелами в одной команде с `scp` даёт ошибку `Could not resolve hostname c:`. Сначала переходим в каталог проекта на ПК, потом копируем только имена файлов.
-
-**Шаг 1 — на сервере.** Подключитесь по SSH, создайте каталог. Вводите команды **по одной**:
-
-```
-ssh root@85.198.69.132
+```text
+Internet
+  -> external reverse proxy / TLS (Traefik, Caddy, or equivalent)
+  -> frontend nginx :8080
+  -> same-origin /api
+  -> backend FastAPI :8000
 ```
 
-(введите пароль)
+`docker-compose.deploy.yml` defines exactly two application services:
 
-```
-mkdir -p /opt/final-project
-```
-
-```
-exit
-```
+- `frontend` joins the private application bridge and the external proxy network;
+- `backend` joins only the application bridge;
+- neither service publishes an application port on the host.
 
-**Шаг 2 — на вашем ПК.** Откройте PowerShell, перейдите в каталог проекта (одна команда):
+The application bridge is intentionally a normal outbound-capable Docker bridge because the backend must reach public webpages and the configured LLM provider. The external proxy and its TLS configuration are outside this repository.
 
-```
-cd "C:\Users\eshle\Cursor projects\Vibe coding projects\Final project"
-```
+## Prerequisites
 
-**Шаг 3 — на вашем ПК.** Скопируйте файлы на сервер (одна строка; при запросе введите пароль):
+- A Linux server with Docker Engine and Docker Compose v2.
+- Git.
+- An existing external reverse proxy with TLS configured for the application hostname.
+- An existing external Docker network shared by that proxy and the application frontend.
+- SSH access to the server; a non-root account and key-based authentication are recommended.
 
-```
-scp docker-compose.deploy.yml deploy.sh update-containers.sh cron.docker-update.example root@85.198.69.132:/opt/final-project/
-```
+No Docker Hub account or application-port firewall rule is required by this workflow.
 
-**Шаг 4 — на сервере.** Снова подключитесь по SSH и перейдите в каталог:
+## Clone or update the checkout
 
-```
-ssh root@85.198.69.132
-```
+Clone the repository into a deployment directory:
 
-```
-cd /opt/final-project
+```sh
+git clone https://github.com/OWNER/site-insight-ai.git
+cd site-insight-ai
 ```
-
-Путь к проекту на сервере: `/opt/final-project` — понадобится для cron и логов.
-
----
-
-## 5. Сборка и публикация образов в Docker Hub
 
-**Где:** ваш ПК (PowerShell). Образы нужно собрать и отправить в Docker Hub один раз (или после каждого обновления кода).
+For an existing checkout, select a trusted branch, tag, or commit before deploying:
 
-### 5.1. Вход в Docker Hub
-
-Одна команда; затем введите логин и пароль Docker Hub:
-
+```sh
+git fetch --prune origin
+git switch main
+git pull --ff-only origin main
+git status --short
 ```
-docker login
-```
 
-### 5.2. Сборка и отправка backend
+The final status command must produce no output. Deployment images are built from exactly the files in the current checkout.
 
-**Где:** ваш ПК, в **корне проекта** (папка, где лежат `Backend-Dockerfile`, папка `app`, `requirements.txt`).
+## Backend environment
 
-Сначала перейдите в корень проекта (одна команда):
+Create the backend runtime file from the committed template:
 
-```
-cd "C:\Users\eshle\Cursor projects\Vibe coding projects\Final project"
+```sh
+cp .env.example .env
+chmod 600 .env
 ```
 
-Сборка образа. **Вся строка целиком**, в конце обязательно **пробел и точка** (контекст сборки):
+Edit `.env` and replace its placeholders with the OpenAI-compatible provider values for this deployment. The file contains backend runtime configuration and secrets only. It is ignored by Git, must never be committed, and should remain readable only by the deployment account where practical.
 
-```
-docker build -f Backend-Dockerfile -t eliv1982/backend:latest .
-```
+Do not put `PROXY_NETWORK` or `IMAGE_TAG` in `.env`. They are deployment inputs supplied through the invoking shell, CI job, or deployment environment. `deploy.sh` checks that `.env` exists but does not source or print it.
 
-Отправка образа в Docker Hub:
-
-```
-docker push eliv1982/backend:latest
-```
+## Deployment variables
 
-### 5.3. Сборка и отправка frontend
+### `PROXY_NETWORK`
 
-**Где:** ваш ПК. Перейдите в папку `frontend` (одна команда):
+Required. This is the name of the existing external Docker network used by the reverse proxy:
 
+```sh
+export PROXY_NETWORK=proxy-network-name
+docker network inspect "$PROXY_NETWORK"
 ```
-cd frontend
-```
 
-Сборка (в конце строки — **пробел и точка**):
+The deployment script validates the name and stops if the network does not exist.
 
-```
-docker build -t eliv1982/frontend:latest .
-```
+### `IMAGE_TAG`
 
-Отправка в Docker Hub:
+Optional when using `deploy.sh`. If omitted, the script derives the current 12-character Git `HEAD`:
 
-```
-docker push eliv1982/frontend:latest
+```sh
+unset IMAGE_TAG
 ```
 
-Вернуться в корень проекта:
+An explicit release tag can be supplied when required:
 
+```sh
+export IMAGE_TAG=release-1
 ```
-cd ..
-```
-
-После этого на сервере можно выполнить `./deploy.sh` или `docker compose pull` и `up -d`.
-
----
-
-## 6. Настройка окружения на сервере
-
-**Где:** сервер (вы подключены по SSH).
 
-### 6.1. Создание файла .env
+Both backend and frontend images receive the same tag. `IMAGE_TAG` identifies a build of the current checkout; it does not select a Git revision or change the files being built.
 
-Перейдите в каталог проекта:
+## Reverse proxy integration
 
-```
-cd /opt/final-project
-```
+Attach the external reverse-proxy container to the same Docker network named by `PROXY_NETWORK`. Configure the proxy to route the application's HTTPS hostname to the `frontend` service on port 8080.
 
-Откройте редактор для создания файла `.env`:
+The reverse proxy owns public HTTP/HTTPS listeners, certificates, and TLS policy. The backend must not be exposed or targeted directly. Browser API calls remain same-origin under `/api`; frontend nginx forwards those requests to the internal `backend:8000` service.
 
-```
-nano .env
-```
+Provider-specific labels and proxy configuration intentionally remain outside this repository.
 
-Добавьте переменные для backend (по необходимости):
+## Deploy
 
-```env
-# Прокси/API для LLM (если backend использует)
-BASE_URL=https://your-proxy.example.com/v1
-OPENAI_API_KEY=your-api-key
+With `.env` present, `PROXY_NETWORK` exported, and the checkout clean, run:
 
-# или
-# PROXY_API_URL=https://...
-# API_KEY=...
+```sh
+bash ./deploy.sh
 ```
 
-Сохраните файл (в nano: `Ctrl+O`, Enter, затем `Ctrl+X`).
+If deployment packaging has made the script executable, `./deploy.sh` is equivalent. The repository currently tracks the script as a regular non-executable file, so invoking it through Bash avoids changing the clean checkout's file mode.
 
-Файл `.env` не должен попадать в Git — на сервере он создаётся вручную и хранится только на сервере.
+The script:
 
----
+1. enables strict shell behavior;
+2. verifies Git, Docker, Compose v2, `.env`, and the production Compose file;
+3. validates `PROXY_NETWORK` and an optional explicit `IMAGE_TAG`;
+4. derives `IMAGE_TAG` from the current 12-character `HEAD` when absent;
+5. rejects a dirty working tree;
+6. verifies the external proxy network;
+7. builds backend and frontend images from the current checkout;
+8. runs `docker compose ... up -d --wait`;
+9. reports final service status.
 
-## 7. Первый запуск приложения
+It does not pull `latest`, perform unattended updates, or run `docker compose down` first.
 
-**Где:** сервер (каталог `/opt/final-project`).
+## Health verification
 
-**Вариант 1 — скрипт deploy.sh (удобнее).** Команды по одной:
+Direct Compose commands must receive the same deployment values used for the release. If the default tag was used, set it in the current shell before running them:
 
+```sh
+export IMAGE_TAG="$(git rev-parse --short=12 HEAD)"
+export PROXY_NETWORK=proxy-network-name
 ```
-cd /opt/final-project
-```
 
-```
-chmod +x deploy.sh
-```
+Check status and recent service logs:
 
+```sh
+docker compose -f docker-compose.deploy.yml ps
+docker compose -f docker-compose.deploy.yml logs --tail=100 backend
+docker compose -f docker-compose.deploy.yml logs --tail=100 frontend
 ```
-./deploy.sh
-```
-
-Скрипт сам сделает загрузку образов и запуск контейнеров.
 
-**Вариант 2 — вручную.** По одной команде:
+The services also provide dependency-free container-local health endpoints:
 
+```sh
+docker compose -f docker-compose.deploy.yml exec backend python -c 'import urllib.request; print(urllib.request.urlopen("http://127.0.0.1:8000/health").read().decode())'
+docker compose -f docker-compose.deploy.yml exec frontend wget -qO- http://127.0.0.1:8080/health
 ```
-cd /opt/final-project
-```
 
-```
-docker compose -f docker-compose.deploy.yml pull
-```
+After the external proxy is configured, verify the public frontend health and same-origin backend path through that proxy:
 
+```sh
+curl -fsS https://your-app.example/health
+curl -fsS https://your-app.example/api/health
 ```
-docker compose -f docker-compose.deploy.yml up -d
-```
-
-После этого работают:
-- **Backend**: порт `8000`
-- **Frontend**: порт `5173`
 
----
+Because the production Compose file publishes no host application ports, do not test it through public host ports 8080 or 8000.
 
-## 8. Проверка работы
+## Upgrade
 
-**Где:** сервер. Проверить, что контейнеры запущены:
+Choose and check out the trusted revision first, confirm the tree is clean, and then deploy that checkout:
 
+```sh
+git fetch --prune origin
+git switch main
+git pull --ff-only origin main
+git status --short
+export PROXY_NETWORK=proxy-network-name
+unset IMAGE_TAG
+bash ./deploy.sh
 ```
-docker ps
-```
-
-Должны быть контейнеры `backend` и `frontend` в статусе `Up`.
-
-**Проверка с вашего ПК в браузере** — откройте по этим ссылкам (для вашего сервера `85.198.69.132`):
-
-| Сервис   | Ссылка |
-|----------|--------|
-| **Frontend** | http://85.198.69.132:5173 |
-| **Backend API (Swagger)** | http://85.198.69.132:8000/docs |
-| **Backend API (корень)** | http://85.198.69.132:8000 |
-
-Если у вас другой IP или домен — подставьте его вместо `85.198.69.132`. Если страница не открывается — откройте порты по инструкции ниже.
 
-### 8.1. Как открыть порты на сервере
+For a trusted tag or commit, check it out instead of pulling `main`. The deploy script rebuilds the two images, updates the services in place, and waits for service health.
 
-**Где:** сервер (подключены по SSH). Нужно открыть порты **5173** (frontend) и **8000** (backend).
+## Rollback
 
-**Вариант 1 — UFW (Ubuntu, Debian и др.)**
+1. Identify the previous known-good commit or signed/trusted tag.
+2. Check out that revision.
+3. Confirm `git status --short` is empty.
+4. Keep `PROXY_NETWORK` set to the deployment's existing proxy network.
+5. Run `bash ./deploy.sh` so the previous checkout is rebuilt and started.
 
-Проверить, включён ли firewall:
+For example:
 
+```sh
+git fetch --prune origin
+git switch --detach KNOWN_GOOD_COMMIT
+git status --short
+export PROXY_NETWORK=proxy-network-name
+export IMAGE_TAG="$(git rev-parse --short=12 HEAD)"
+bash ./deploy.sh
 ```
-sudo ufw status
-```
-
-Открыть порты и при необходимости включить UFW (команды по одной):
-
-```
-sudo ufw allow 5173/tcp
-```
-
-```
-sudo ufw allow 8000/tcp
-```
-
-Если UFW был неактивен и вы его включаете, не закрывайте SSH (порт 22), иначе потеряете доступ:
 
-```
-sudo ufw allow 22/tcp
-```
+Setting `IMAGE_TAG` alone is not a rollback. It only names images built from the files currently checked out; the source revision must be changed first.
 
-```
-sudo ufw enable
-```
+## Logs, status, and restart
 
-Проверить правила:
+With the deployment variables set as described under health verification:
 
+```sh
+docker compose -f docker-compose.deploy.yml ps
+docker compose -f docker-compose.deploy.yml logs --tail=100 --follow backend
+docker compose -f docker-compose.deploy.yml logs --tail=100 --follow frontend
 ```
-sudo ufw status
-```
 
-**Вариант 2 — firewalld (CentOS, RHEL, Fedora)**
+Prefer targeted operations over stopping the whole stack:
 
-```
-sudo firewall-cmd --permanent --add-port=5173/tcp
+```sh
+docker compose -f docker-compose.deploy.yml restart backend
+docker compose -f docker-compose.deploy.yml up -d --wait --force-recreate frontend
 ```
 
-```
-sudo firewall-cmd --permanent --add-port=8000/tcp
-```
+For a source or image change, use the controlled deployment script rather than manually tearing the stack down.
 
-```
-sudo firewall-cmd --reload
-```
+## Firewall and security boundary
 
-**Если сервер в облаке (VPS)**
+- Expose only the reverse proxy's public HTTP/HTTPS ports as required.
+- Restrict SSH to appropriate source networks and use key-based authentication where possible.
+- Do not publish application ports 8080 or 8000 from this Compose stack.
+- Do not attach the backend to the external proxy network.
+- Keep `.env` backend-only and never make its secrets available to the frontend or reverse proxy.
+- Consider infrastructure-level outbound filtering as additional defense against residual DNS-rebinding/TOCTOU risk.
 
-У провайдера (Selectel, Timeweb, AWS, DigitalOcean и т.п.) часто есть **свой** firewall или «Группы безопасности» / «Правила доступа». Нужно в панели управления добавить входящие правила: разрешить TCP порты **5173** и **8000** (и оставить 22 для SSH). Без этого трафик до сервера не дойдёт, даже если на самом сервере порты открыты.
+The production services run non-root with read-only filesystems, limited tmpfs storage, all capabilities dropped, `no-new-privileges`, healthchecks, PID/resource limits, and bounded Docker logs.
 
----
+## Updates
 
-## 9. Автообновление контейнеров
+Releases are deliberate and manual. The former hourly updater and cron mechanism have been removed. The deployment does not pull mutable `latest` images; each release builds both images from the selected clean checkout under one explicit tag.
 
-**Где:** сервер. Скрипт `update-containers.sh` по cron раз в час проверяет образы на Docker Hub и при новых версиях перезапускает контейнеры.
+## Troubleshooting
 
-### 9.1. Сделать скрипт исполняемым
+### `PROXY_NETWORK is required`
 
-Команды по одной:
+Export the existing external network name in the same shell that invokes the deployment:
 
-```
-cd /opt/final-project
+```sh
+export PROXY_NETWORK=proxy-network-name
 ```
 
-```
-chmod +x update-containers.sh
-```
+### External proxy network does not exist
 
-### 9.2. Проверка вручную
+Confirm the name and ensure the reverse-proxy stack created the network:
 
+```sh
+docker network inspect "$PROXY_NETWORK"
 ```
-./update-containers.sh
-```
 
-В выводе будет видно, какие контейнеры обновлены, какие без изменений.
+Do not silently create a differently named network; the proxy and frontend must share the same one.
 
-### 9.3. Настройка cron (запуск каждый час)
+### Missing backend environment file
 
-**Способ 1 — crontab пользователя**
+Create `.env` from `.env.example`, replace the placeholders, and restrict its permissions. Do not put deployment variables in that file.
 
-```bash
-crontab -e
-```
+### Dirty working tree
 
-Добавьте строку (замените `/opt/final-project` на ваш путь):
+Inspect `git status --short`. Commit intended source changes or restore/stash local tracked changes before deployment. Do not bypass the clean-checkout guard.
 
-```
-0 * * * * /opt/final-project/update-containers.sh >> /var/log/update-containers.log 2>&1
-```
+### Backend or frontend is unhealthy
 
-Сохраните и выйдите. Лог обновлений: `/var/log/update-containers.log`. Создать файл и дать права при необходимости:
+Use Compose status and service logs. Backend `/health` is process-local and does not call a webpage or the LLM. Frontend `/health` is served directly by nginx.
 
-```bash
-sudo touch /var/log/update-containers.log
-sudo chmod 644 /var/log/update-containers.log
-```
+### Proxy cannot reach frontend
 
-**Способ 2 — через /etc/cron.d/ (от root)**
+Confirm the proxy and frontend are attached to the network named by `PROXY_NETWORK`, then confirm the proxy target is the frontend service on port 8080. Do not add a host port as a workaround.
 
-```bash
-sudo cp /opt/final-project/cron.docker-update.example /etc/cron.d/docker-update-containers
-sudo nano /etc/cron.d/docker-update-containers
-```
+### Frontend cannot resolve backend
 
-Замените `/path/to/project` на реальный путь, например `/opt/final-project`:
+The backend Compose service must remain named `backend`, and both services must share the application network. From frontend, test the internal route:
 
-```
-0 * * * * root /opt/final-project/update-containers.sh >> /var/log/update-containers.log 2>&1
+```sh
+docker compose -f docker-compose.deploy.yml exec frontend wget -qO- http://backend:8000/health
 ```
-
-Сохраните. Убедитесь, что скрипт исполняемый (`chmod +x update-containers.sh`).
-
-После этого обновления с Docker Hub будут подтягиваться и применяться каждый час автоматически.
-
----
-
-## 10. Полезные команды
-
-Выполняются **на сервере** в каталоге проекта (`/opt/final-project` или ваш путь).
-
-| Действие | Команда |
-|----------|--------|
-| Статус контейнеров | `docker ps` |
-| Логи backend | `docker logs backend` |
-| Логи frontend | `docker logs frontend` |
-| Остановить всё | `docker compose -f docker-compose.deploy.yml down` |
-| Запустить снова | `docker compose -f docker-compose.deploy.yml up -d` |
-| Обновить вручную | `./update-containers.sh` |
-| Посмотреть лог автообновлений | `tail -f /var/log/update-containers.log` |
-
----
-
-## Краткий чеклист деплоя
 
-1. Подключиться к серверу: `ssh user@IP`.
-2. Проверить Docker: `docker --version`, `docker compose version`.
-3. Разместить проект (git clone или scp): в каталоге должны быть `docker-compose.deploy.yml`, `deploy.sh`, `update-containers.sh`.
-4. Создать на сервере `.env` с ключами/URL для backend.
-5. Собрать и запушить образы с локальной машины в Docker Hub (`docker build` / `docker push`).
-6. На сервере: `chmod +x deploy.sh && ./deploy.sh` (или вручную: pull + up -d).
-7. Проверить: `docker ps`, открыть в браузере `http://IP:5173` и `http://IP:8000`.
-8. Настроить автообновление: `chmod +x update-containers.sh`, добавить задачу в cron на запуск раз в час.
+### Long analyses time out at the external proxy
 
-Готово.
+The browser client and frontend nginx allow up to 300 seconds for analysis traffic. Configure the external proxy's upstream timeout consistently with that limit while retaining appropriate global limits. Do not remove timeouts entirely.

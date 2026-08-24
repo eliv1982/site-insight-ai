@@ -45,10 +45,10 @@ export default function App() {
           className="text-center sm:text-left"
         >
           <h1 className="text-3xl font-bold tracking-tight text-slate-800 sm:text-4xl md:text-5xl">
-            Анализатор сайтов
+            Site Insight AI
           </h1>
           <p className="mt-3 text-slate-600 text-base sm:text-lg">
-            Получите краткое резюме содержания сайта
+            Структурированный анализ текста одной публичной веб-страницы
           </p>
         </motion.div>
 
